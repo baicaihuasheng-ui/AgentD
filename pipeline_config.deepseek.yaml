@@ -1,0 +1,10 @@
+run_id: "BCL2_deepseek_small_001"
+protein: "BCL-2"
+disease: "chronic lymphocytic leukemia"
+model: "deepseek-flash"
+iterations: 1
+num_smiles: 2
+run_boltz: false
+boltz_top_k: 2
+min_qed: 0.50
+min_pkd: 5.0

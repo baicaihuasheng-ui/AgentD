@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+from agentD.runtime_config import load_runtime,reinvent_command,configure_runtime
+
 AGENTD_ROOT = Path(__file__).resolve().parent  # .../DrugDiscoveryAgent/AgentD
 
 
@@ -119,22 +121,9 @@ def _parse_fasta_to_sequence(fasta_text: str) -> str:
 
 
 def _load_api_keys_fallback() -> None:
-    """
-    Prefer env vars; if missing, optionally fall back to configs/secret_keys.py.
-    Never prints secrets.
-    """
-    if os.getenv("OPENAI_API_KEY") and os.getenv("SERPER_API_KEY"):
-        return
-    try:
-        # configs.secret_keys.py 
-        from configs import secret_keys
+    """Load only explicitly configured DeepSeek settings; no legacy key fallback."""
+    load_runtime()
 
-        if not os.getenv("SERPER_API_KEY") and getattr(secret_keys, "serper_api_key", None):
-            os.environ["SERPER_API_KEY"] = secret_keys.serper_api_key
-        if not os.getenv("OPENAI_API_KEY") and getattr(secret_keys, "openai_api_key", None):
-            os.environ["OPENAI_API_KEY"] = secret_keys.openai_api_key
-    except Exception:
-        return
 
 
 # -----------------------------
@@ -160,6 +149,7 @@ class JobManager:
 
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
+        self.processes = {}
         self.jobs_dir = run_dir / "jobs"
         self.logs_dir = run_dir / "logs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -193,10 +183,13 @@ class JobManager:
             command,
             cwd=str(cwd),
             env=proc_env,
+            stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
         )
 
+        log_f.close()
+        self.processes[job_id] = p
         info = JobInfo(
             job_id=job_id,
             pid=int(p.pid),
@@ -213,26 +206,12 @@ class JobManager:
         Check if a process is alive, handling zombie processes on Linux.
         A zombie process (defunct) still has a PID but is not truly running.
         """
+        import psutil
         try:
-            os.kill(pid, 0)
-        except OSError:
+            process = psutil.Process(pid)
+            return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
             return False
-
-        # On Linux, check /proc/<pid>/status for zombie state
-        proc_status = Path(f"/proc/{pid}/status")
-        if proc_status.exists():
-            try:
-                content = proc_status.read_text()
-                for line in content.splitlines():
-                    if line.startswith("State:"):
-                        # State: Z (zombie) or State: R (running), etc.
-                        if "Z" in line or "zombie" in line.lower():
-                            return False
-                        break
-            except Exception:
-                pass
-
-        return True
 
     def status(self, job_id: str) -> Dict[str, Any]:
         meta_path = self._job_meta_path(job_id)
@@ -240,14 +219,15 @@ class JobManager:
             return {"job_id": job_id, "status": "unknown", "error": "job id not found"}
 
         meta = _safe_json_load(meta_path)
-        pid = int(meta.get("pid", -1))
-        alive = pid > 0 and self._pid_is_alive(pid)
-
-        if meta.get("status") == "running" and not alive:
-            # We don't have exit code portably without psutil; infer from log footer if worker writes it.
-            meta["status"] = "finished"
-            meta["finished_at"] = _now_utc_iso()
-            _safe_json_dump(meta_path, meta)
+        process = self.processes.get(job_id)
+        if meta.get("status") == "running":
+            code = process.poll() if process is not None else None
+            if code is not None:
+                meta.update(status="finished" if code == 0 else "failed", returncode=code, finished_at=_now_utc_iso())
+                _safe_json_dump(meta_path, meta)
+            elif process is None and not self._pid_is_alive(int(meta.get("pid", -1))):
+                meta.update(status="failed", error="Worker exited without a recoverable exit code")
+                _safe_json_dump(meta_path, meta)
 
         return meta
 
@@ -312,7 +292,10 @@ def _worker_predict_affinity(*, sequence: str, smiles_csv: str, out_dir: str) ->
         from agentD.tools.prediction import predict_affinity_batch  # type: ignore
 
         payload = json.dumps({"sequence": sequence, "smiles_path": smiles_csv})
-        result = predict_affinity_batch(payload)
+        result = predict_affinity_batch.invoke({"data": payload})
+        if not isinstance(result, tuple) or len(result) != 2 or not Path(result[1]).is_file():
+            print(str(result), file=sys.stdout)
+            return 1
         return 0
     finally:
         sys.stderr = old_stderr
@@ -354,7 +337,10 @@ def _worker_predict_admet(*, smiles_csv: str, out_dir: str) -> int:
         _ensure_agentd_importable()
         from agentD.tools.prediction import get_admet_predictions  # type: ignore
 
-        result = get_admet_predictions(smiles_csv)
+        result = get_admet_predictions.invoke({"csv_file_path": smiles_csv})
+        if not isinstance(result, str) or not result.startswith("ADMET predictions saved to "):
+            print(str(result), file=sys.stdout)
+            return 1
         return 0
     finally:
         sys.stderr = old_stderr
@@ -434,27 +420,10 @@ def _merge_affinity_admet(affinity_csv: Path, admet_csv: Path, out_csv: Path) ->
     We use affinity's SMILES as the canonical one and merge on row position.
     """
     import pandas as pd
-
-    df_aff = pd.read_csv(affinity_csv)
-    df_admet = pd.read_csv(admet_csv)
-    
-    if "SMILES" not in df_aff.columns:
-        raise ValueError("Affinity CSV must include a 'SMILES' column")
-    
-    # Both files should have same number of rows (same input)
-    # Merge by position (index), use affinity SMILES as canonical
-    if len(df_aff) != len(df_admet):
-        # Fallback to SMILES-based merge if row counts don't match
-        if "SMILES" not in df_admet.columns:
-            raise ValueError("ADMET CSV must include a 'SMILES' column for SMILES-based merge")
-        merged = pd.merge(df_admet, df_aff, on="SMILES", how="inner")
-    else:
-        # Index-based merge: drop ADMET's SMILES, use affinity's SMILES
-        df_admet_no_smiles = df_admet.drop(columns=["SMILES"], errors="ignore")
-        df_admet_no_smiles = df_admet_no_smiles.reset_index(drop=True)
-        df_aff = df_aff.reset_index(drop=True)
-        merged = pd.concat([df_aff, df_admet_no_smiles], axis=1)
-    
+    from agentD.optimization import identify, merge_predictions
+    affinity = pd.read_csv(affinity_csv)
+    candidates = identify(affinity[[c for c in ("candidate_id", "SMILES") if c in affinity]])
+    merged = merge_predictions(candidates, affinity, pd.read_csv(admet_csv))
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(out_csv, index=False)
     return out_csv
@@ -465,64 +434,43 @@ def _score_candidates(property_csv: Path, out_csv: Path) -> Path:
     Add rule-based booleans and QED + num_passed_rules.
     Uses RDKit-derived properties primarily, and CSV values for specific FDA fields.
     """
-    import io
-    import warnings
     import pandas as pd
-    
-    # Suppress RDKit warnings including C-level output
-    warnings.filterwarnings("ignore")
-    
-    # OS-level stderr suppression to catch C-level RDKit output
-    old_stderr_fd = os.dup(2)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull_fd, 2)
-    os.close(devnull_fd)
-    
-    old_stderr = sys.stderr
-    sys.stderr = io.StringIO()
-    
-    try:
-        from agentD.analysis.drug_likeness_analyzer import DrugLikenessAnalyzer  # type: ignore
+    from agentD.analysis.drug_likeness_analyzer import DrugLikenessAnalyzer  # type: ignore
 
-        df = pd.read_csv(property_csv)
-        rows: List[Dict[str, Any]] = []
-        for _, r in df.iterrows():
-            d = r.to_dict()
-            smiles = d.get("SMILES")
-            analyzer = DrugLikenessAnalyzer(data=d, smiles=smiles)
-            report = analyzer.get_summary_report()
+    df = pd.read_csv(property_csv)
+    rows: List[Dict[str, Any]] = []
+    for _, r in df.iterrows():
+        d = r.to_dict()
+        smiles = d.get("SMILES")
+        analyzer = DrugLikenessAnalyzer(data=d, smiles=smiles)
+        report = analyzer.get_summary_report()
 
-            # Normalize into flat columns
-            lip = bool(report.get("lipinski_rule_of_5"))
-            veb = bool(report.get("veber_rule"))
-            gho = bool(report.get("ghose_filter"))
-            ro3 = bool(report.get("rule_of_3"))
-            opr = bool(report.get("oprea_lead_like"))
-            num_passed = int(sum([lip, veb, gho, ro3, opr]))
-            qed = analyzer.calculated_properties.get("qed")
+        # Normalize into flat columns
+        lip = bool(report.get("lipinski_rule_of_5"))
+        veb = bool(report.get("veber_rule"))
+        gho = bool(report.get("ghose_filter"))
+        ro3 = bool(report.get("rule_of_3"))
+        opr = bool(report.get("oprea_lead_like"))
+        num_passed = int(sum([lip, veb, gho, ro3, opr]))
+        qed = analyzer.calculated_properties.get("qed")
 
-            out_row = dict(d)
-            out_row.update(
-                {
-                    "lipinski_rule_of_5": lip,
-                    "veber_rule": veb,
-                    "ghose_filter": gho,
-                    "rule_of_3": ro3,
-                    "oprea_lead_like": opr,
-                    "num_passed_rules": num_passed,
-                    "QED": qed,
-                }
-            )
-            rows.append(out_row)
-        scored = pd.DataFrame(rows)
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-        scored.to_csv(out_csv, index=False)
-        return out_csv
-    finally:
-        sys.stderr = old_stderr
-        # Restore OS-level stderr
-        os.dup2(old_stderr_fd, 2)
-        os.close(old_stderr_fd)
+        out_row = dict(d)
+        out_row.update(
+            {
+                "lipinski_rule_of_5": lip,
+                "veber_rule": veb,
+                "ghose_filter": gho,
+                "rule_of_3": ro3,
+                "oprea_lead_like": opr,
+                "num_passed_rules": num_passed,
+                "QED": qed,
+            }
+        )
+        rows.append(out_row)
+    scored = pd.DataFrame(rows)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    scored.to_csv(out_csv, index=False)
+    return out_csv
 
 
 def _select_final_candidates(
@@ -598,58 +546,37 @@ def _refine_smiles(
     out_csv: Path,
     *,
     protein: str,
-    model: str = "gpt-4o",
+    model: str = "deepseek-flash",
 ) -> Path:
     """
     Run the LLM-driven SMILES refinement. This is the step that was manual in notebooks.
     We automate it and save a deterministic mapping file with Updated_SMILES + rationale.
     Output format: SMILES, Updated_SMILES, Property, Rationale
     """
-    import io
-    import warnings
-    
-    warnings.filterwarnings("ignore")
-    
-    old_stderr_fd = os.dup(2)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull_fd, 2)
-    os.close(devnull_fd)
-    
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    sys.stdout = io.StringIO()
-    sys.stderr = io.StringIO()
-    
-    try:
-        _load_api_keys_fallback()
-        from agentD.agents import agentD as AgentDClass  # type: ignore
-        from agentD.tools.prediction import check_smiles_validity  # type: ignore
-        from agentD.prompts.molecular_refinement import PREFIX, SUFFIX, FORMAT_INSTRUCTIONS  # type: ignore
-        from agentD.utils import process_dataset_with_agent  # type: ignore
+    _load_api_keys_fallback()
+    from agentD.agents import agentD as AgentDClass  # type: ignore
+    from agentD.tools.prediction import check_smiles_validity  # type: ignore
+    from agentD.prompts.molecular_refinement import PREFIX, SUFFIX, FORMAT_INSTRUCTIONS  # type: ignore
+    from agentD.utils import process_dataset_with_agent  # type: ignore
 
-        tools = [check_smiles_validity]
-        refinement_agent = AgentDClass(
-            tools,
-            model=model,
-            prefix=PREFIX,
-            suffix=SUFFIX,
-            format_instructions=FORMAT_INSTRUCTIONS,
-        ).agent
+    tools = [check_smiles_validity]
+    refinement_agent = AgentDClass(
+        tools,
+        model=model,
+        prefix=PREFIX,
+        suffix=SUFFIX,
+        format_instructions=FORMAT_INSTRUCTIONS,
+    ).agent
 
-        df_out = process_dataset_with_agent(str(in_csv), protein, tools, refinement_agent)
+    df_out = process_dataset_with_agent(str(in_csv), protein, tools, refinement_agent)
 
-        keep_cols = ["SMILES", "Updated_SMILES", "Property", "Rationale"]
-        available_cols = [c for c in keep_cols if c in df_out.columns]
-        df_out = df_out[available_cols]
+    keep_cols = ["candidate_id", "SMILES", "Updated_SMILES", "Property", "Rationale", "status", "error"]
+    available_cols = [c for c in keep_cols if c in df_out.columns]
+    df_out = df_out[available_cols]
 
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-        df_out.to_csv(out_csv, index=False)
-        return out_csv
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        os.dup2(old_stderr_fd, 2)
-        os.close(old_stderr_fd)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(out_csv, index=False)
+    return out_csv
 
 
 def _extract_updated_smiles(refinement_csv: Path, out_smiles_csv: Path) -> Path:
@@ -659,7 +586,9 @@ def _extract_updated_smiles(refinement_csv: Path, out_smiles_csv: Path) -> Path:
     df = pd.read_csv(refinement_csv)
     if "Updated_SMILES" not in df.columns:
         raise ValueError("Refinement CSV missing Updated_SMILES column")
-    updated = df[["Updated_SMILES"]].dropna()
+    if "status" in df:
+        df = df[df.status.isin(["modified", "unchanged"])]
+    updated = df[[c for c in ("candidate_id", "Updated_SMILES") if c in df]].dropna()
     updated = updated.rename(columns={"Updated_SMILES": "SMILES"})
     updated = updated[updated["SMILES"].astype(str).str.strip() != ""]
     out_smiles_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -728,7 +657,7 @@ def _run_reinvent_pooling(
     *,
     run_dir: Path,
     initial_smiles: str,
-    model: str = "gpt-4o",
+    model: Optional[str] = None,
     num_smiles: int = 20,  # Number of SMILES to sample (reduced for faster testing)
 ) -> Dict[str, Any]:
     """
@@ -736,12 +665,14 @@ def _run_reinvent_pooling(
 
     Uses REINVENT_PATH from configs/tool_globals.py.
     """
+    model = model or load_runtime().model
+    configure_runtime({'model': model})
     _load_api_keys_fallback()
     os.chdir(run_dir)
 
     _ensure_agentd_importable()
     import agentD.tools.generation as gen  
-    from configs.tool_globals import REINVENT_PATH  
+    REINVENT_PATH = str(load_runtime().reinvent_path)
 
     # Validate that generation.py can find expected file
     expected_sampling = Path(REINVENT_PATH) / "configs" / "toml" / "sampling.toml"
@@ -775,9 +706,11 @@ def _run_reinvent_pooling(
     # Execute REINVENT. 
     def _run_reinvent_cfg(cfg: str) -> str:
         log_file = cfg.replace(".toml", ".log")
-        cmd = _command_in_env(["reinvent", "-l", log_file, cfg])
+        cmd = reinvent_command(cfg, log_file)
         try:
-            subprocess.run(cmd, check=True, cwd=str(run_dir))
+            # Windows Python startup can block on an inherited MCP protocol pipe.
+            stdin_options = {"stdin": subprocess.DEVNULL} if sys.platform == "win32" else {}
+            subprocess.run(cmd, check=True, cwd=str(run_dir), **stdin_options)
             return "REINVENT execution completed successfully."
         except subprocess.CalledProcessError as e:
             return f"Error occurred while running REINVENT: {e}"
@@ -830,6 +763,10 @@ def _wait_for_jobs(
     """
     wait_count = 0
     while True:
+        from agentD.call_budget import current_budget
+        budget = current_budget()
+        if budget:
+            budget.check_deadline()
         statuses = {jid: jm.status(jid) for jid in job_ids}
         running = [jid for jid, s in statuses.items() if s.get("status") == "running"]
         if not running:
@@ -844,6 +781,77 @@ def _wait_for_jobs(
                 "statuses": {jid: s.get("status") for jid, s in statuses.items()},
             })
     return {jid: jm.status(jid) for jid in job_ids}
+
+
+def _failed_iteration(candidates_csv, iter_dir, error):
+    import pandas as pd
+    from agentD.optimization import identify
+    frame = identify(pd.read_csv(candidates_csv))
+    frame = frame.assign(status="failed", error=error, prediction_source="unavailable")
+    path = iter_dir / "property/comparison.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False)
+    return {"ok": False, "error": error, "comparison_csv": str(path), "modified_count": 0}
+
+
+def _optimize_iteration(*, candidates_csv, affinity_csv, admet_csv, iter_dir, sequence, protein, model, jm, progress, iteration):
+    """Preserve all candidates while predicting only valid structural changes."""
+    import pandas as pd
+    from agentD.optimization import identify, merge_predictions, comparison_table
+    candidates = identify(pd.read_csv(candidates_csv))
+    try:
+        before = merge_predictions(candidates, pd.read_csv(affinity_csv), pd.read_csv(admet_csv))
+    except Exception as error:
+        return _failed_iteration(candidates_csv, iter_dir, "Baseline predictions invalid: " + str(error))
+    refinement_dir = iter_dir / "refinement"
+    refinement_dir.mkdir(parents=True, exist_ok=True)
+    merged_path = refinement_dir / "optimization_input.csv"
+    before.to_csv(merged_path, index=False)
+    refinement_path = refinement_dir / "refinement.csv"
+    try:
+        _refine_smiles(merged_path, refinement_path, protein=protein, model=model)
+        refinement = pd.read_csv(refinement_path, keep_default_na=False)
+    except Exception as error:
+        refinement = candidates[["candidate_id", "SMILES"]].copy()
+        refinement = refinement.assign(Updated_SMILES="", Property="", Rationale="", status="failed", error=type(error).__name__)
+        refinement.to_csv(refinement_path, index=False)
+    changed = refinement[refinement.status == "modified"][["candidate_id", "Updated_SMILES"]].rename(columns={"Updated_SMILES": "SMILES"})
+    after = pd.DataFrame()
+    error = None
+    stopped = refinement.error.isin(["BudgetExceeded", "DeepSeekCallError"]).any()
+    if not changed.empty and not stopped:
+        changed_path = refinement_dir / "modified_candidates.csv"
+        changed.to_csv(changed_path, index=False)
+        try:
+            jobs = _run_prediction_jobs(jm=jm, iter_dir=iter_dir, smiles_csv=changed_path, seq=sequence, iteration=iteration, suffix="_after")
+            statuses = _wait_for_jobs(jm, [job.job_id for job in jobs], progress, f"iteration_{iteration}_after_prediction")
+            if any(status.get("returncode") != 0 for status in statuses.values()):
+                raise RuntimeError("Updated prediction worker failed")
+            affinity_after, admet_after = _find_prediction_outputs(iter_dir, changed_path.name)
+            if not affinity_after or not admet_after:
+                raise RuntimeError("Updated prediction outputs missing")
+            after = merge_predictions(changed, pd.read_csv(affinity_after), pd.read_csv(admet_after))
+        except Exception as failure:
+            error = type(failure).__name__ + ": " + str(failure)
+    comparison = comparison_table(before, refinement, after)
+    comparison_path = iter_dir / "property/comparison.csv"
+    comparison.to_csv(comparison_path, index=False)
+    # Build full after tables. Unchanged molecules retain their measured baseline.
+    after_rows = []
+    for _, row in comparison.iterrows():
+        if row.prediction_source == "reused":
+            after_rows.append(before[before.candidate_id == row.candidate_id].iloc[0].to_dict())
+        elif row.prediction_source == "predicted":
+            after_rows.append(after[after.candidate_id == row.candidate_id].iloc[0].to_dict())
+    full_after = pd.DataFrame(after_rows, columns=before.columns)
+    affinity_columns = [c for c in ("candidate_id", "SMILES", "Affinity [pKd]") if c in full_after]
+    full_after[affinity_columns].to_csv(iter_dir / "property/affinity_after.csv", index=False)
+    full_after.drop(columns=["Affinity [pKd]"], errors="ignore").to_csv(iter_dir / "property/admet_after.csv", index=False)
+    failed = comparison.status.isin(["failed", "prediction_failed"]).any()
+    modified_count = int((comparison.prediction_source == "predicted").sum())
+    return {"ok": not failed and modified_count > 0, "refinement_csv": str(refinement_path),
+            "comparison_csv": str(comparison_path), "optimization_input_csv": str(merged_path),
+            "modified_count": modified_count, "error": error or ("No successfully predicted structural changes" if modified_count == 0 else None)}
 
 
 def _run_prediction_jobs(
@@ -941,7 +949,7 @@ def _make_mcp():
         run_boltz: bool = True,
         boltz_top_k: int = 10,
         boltz_extra_args_json: str = "[\"--use_msa_server\",\"--accelerator\",\"gpu\",\"--num_workers\",\"20\"]",
-        model: str = "gpt-4o",
+        model: Optional[str] = None,
         min_qed: float = 0.50,
         min_pkd: float = 5.0,
         run_id: Optional[str] = None,
@@ -957,7 +965,7 @@ def _make_mcp():
         - run_boltz: Whether to run Boltz structure generation (default True)
         - boltz_top_k: Number of top candidates for Boltz (default 10)
         - boltz_extra_args_json: Extra args for Boltz as JSON string
-        - model: LLM model for refinement (default "gpt-4o")
+        - model: LLM model for refinement (default "deepseek-flash")
         - min_qed: Minimum QED score for candidate selection (default 0.50)
         - min_pkd: Minimum pKd value for candidate selection (default 5.0)
         - run_id: Custom run ID (optional, auto-generated if not provided)
@@ -970,10 +978,14 @@ def _make_mcp():
         3. Iterative refinement loop
         4. Boltz structure generation for top candidates
         """
+        model = model or load_runtime().model
+        configure_runtime({'model':model})
         _load_api_keys_fallback()
         _ensure_agentd_importable()
 
         run_root = AGENTD_ROOT / "runs"
+        if run_id and (run_root / run_id / "run_config.json").exists() and os.getenv("AGENTD_RESUME_POOLING") != "1":
+            return {"ok": False, "error": "Pipeline run ID already exists; select a new run ID"}
         run_id2, run_dir = _ensure_run_dir(run_root, run_id)
         jm = JobManager(run_dir)
         progress = ProgressTracker(run_dir)
@@ -997,160 +1009,166 @@ def _make_mcp():
             },
         )
 
-        # --- LLM-based Extraction (same as notebook) ---
-        progress.update("extraction", {"substep": "starting_llm_extraction"})
-        os.chdir(run_dir)
+        if os.getenv("AGENTD_RESUME_POOLING") == "1":
+            extraction = _safe_json_load(run_dir / "extraction.json")
+            if extraction["protein"] != protein or extraction["disease"] != disease:
+                raise ValueError("Checkpoint does not match requested target")
+            seq, smiles = extraction["fasta"], extraction["SMILES"]
+        else:
+            # --- LLM-based Extraction (same as notebook) ---
+            progress.update("extraction", {"substep": "starting_llm_extraction"})
+            os.chdir(run_dir)
         
-        from agentD.agents import agentD as AgentDClass  # type: ignore
-        from agentD.utils import get_tool_decorated_functions  # type: ignore
-        from agentD.prompts.data_extraction import PREFIX, SUFFIX, FORMAT_INSTRUCTIONS  # type: ignore
+            from agentD.agents import agentD as AgentDClass  # type: ignore
+            from agentD.utils import get_tool_decorated_functions  # type: ignore
+            from agentD.prompts.data_extraction import PREFIX, SUFFIX, FORMAT_INSTRUCTIONS  # type: ignore
         
-        # Get retrieval tools for extraction
-        tools = get_tool_decorated_functions(str(AGENTD_ROOT / "agentD" / "tools" / "retrieval.py"))
-        tool_names = [tool.name for tool in tools]
-        tool_desc = [tool.description for tool in tools]
+            # Get retrieval tools for extraction
+            tools = get_tool_decorated_functions(str(AGENTD_ROOT / "agentD" / "tools" / "retrieval.py"))
+            tool_names = [tool.name for tool in tools]
+            tool_desc = [tool.description for tool in tools]
         
-        # Create extraction agent
-        extraction_agent = AgentDClass(
-            tools,
-            model=model,
-            prefix=PREFIX,
-            suffix=SUFFIX,
-            format_instructions=FORMAT_INSTRUCTIONS,
-        ).agent
+            # Create extraction agent
+            extraction_agent = AgentDClass(
+                tools,
+                model=model,
+                prefix=PREFIX,
+                suffix=SUFFIX,
+                format_instructions=FORMAT_INSTRUCTIONS,
+            ).agent
         
-        # Run extraction - LLM discovers drug name, UniProt ID, FASTA, SMILES
-        human_prompt = f"Suggest the potential drug molecules for {disease} targeting the protein {protein}."
-        input_data = {
-            "input": human_prompt,
-            "tools": tools,
-            "tool_names": tool_names,
-            "tool_desc": tool_desc,
-        }
-        
-        extraction_result = extraction_agent.invoke(input_data)
-        progress.update("extraction", {"substep": "llm_extraction_completed"})
-        
-        # Save full extraction response (same as notebook)
-        from agentD.utils import custom_serializer  # type: ignore
-        with open(run_dir / "extraction_response.json", "w", encoding="utf-8") as f:
-            json.dump(extraction_result, f, indent=2, default=custom_serializer)
-        
-        # Extract data from agent's intermediate steps (same approach as notebook)
-        # The agent uses tools: get_uniprot_ids, fetch_uniprot_fasta, search, get_drug_smiles
-        # Each step is [action, observation] where action can be an object or string
-        import re
-        
-        drug_name = None
-        smiles = None
-        uniprot_id = None
-        fasta = None
-        
-        # Parse intermediate steps to get the data the agent retrieved
-        if "intermediate_steps" in extraction_result:
-            for step in extraction_result.get("intermediate_steps", []):
-                if len(step) >= 2:
-                    action = step[0]
-                    observation = step[1]
-                    
-                    # Action can be an object with .tool/.tool_input or a string
-                    tool_name = None
-                    tool_input = None
-                    
-                    if hasattr(action, 'tool'):
-                        tool_name = action.tool
-                        tool_input = action.tool_input
-                    elif isinstance(action, str):
-                        # Parse from string like "tool='get_drug_smiles' tool_input='Venetoclax'..."
-                        tool_match = re.search(r"tool='([^']+)'", action)
-                        input_match = re.search(r"tool_input='([^']+)'", action)
-                        if tool_match:
-                            tool_name = tool_match.group(1)
-                        if input_match:
-                            tool_input = input_match.group(1)
-                    
-                    if tool_name == "get_uniprot_ids" and observation:
-                        # Parse UniProt ID from observation like [['P10415', 'Apoptosis regulator Bcl-2']]
-                        if isinstance(observation, list) and len(observation) > 0:
-                            first = observation[0]
-                            if isinstance(first, (list, tuple)) and len(first) > 0:
-                                uniprot_id = first[0]
-                            elif isinstance(first, str):
-                                uniprot_id = first
-                        elif isinstance(observation, str) and "P" in observation:
-                            match = re.search(r"['\"]([A-Z][0-9A-Z]{4,})['\"]", observation)
-                            if match:
-                                uniprot_id = match.group(1)
-                    
-                    elif tool_name == "fetch_uniprot_fasta" and observation:
-                        # FASTA sequence returned
-                        fasta = observation if isinstance(observation, str) else str(observation)
-                    
-                    elif tool_name == "get_drug_smiles" and observation:
-                        # Drug name is the input, SMILES is the observation
-                        drug_name = tool_input
-                        if isinstance(observation, str) and len(observation) > 10:
-                            smiles = observation
-        
-        # Fallback: use retrieval tools directly if agent didn't get all data
-        from agentD.tools import retrieval_new as R  
-        
-        if not uniprot_id:
-            ids = R.get_uniprot_ids(protein)
-            if isinstance(ids, str) or not ids:
-                return {"ok": False, "run_id": run_id2, "error": f"UniProt lookup failed: {ids}"}
-            uniprot_id = ids[0][0]
-        
-        if not fasta:
-            fasta = R.fetch_uniprot_fasta(uniprot_id) or ""
-        
-        seq = _parse_fasta_to_sequence(fasta)
-        
-        # Fallback for drug name: parse from output text if not found in steps
-        if not drug_name or not smiles:
-            output_text = extraction_result.get("output", "")
-            
-            # Try common patterns like "Venetoclax" (drug names typically capitalized)
-            patterns = [
-                r"([A-Z][a-z]+(?:inib|mab|nib|zole|tide|stat|clax|lib|zumab))\b",  # Common drug suffixes
-                r"drug[:\s]+([A-Z][a-z]+)",
-                r"found\s+([A-Z][a-z]+)",
-                r"identified\s+([A-Z][a-z]+)",
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, output_text)
-                if match:
-                    potential_drug = match.group(1).strip()
-                    # Verify it's a real drug by trying to get SMILES from ChEMBL
-                    test_smiles = R.get_drug_smiles(potential_drug)
-                    if test_smiles and len(test_smiles) > 10:
-                        drug_name = potential_drug
-                        smiles = test_smiles
-                        break
-        
-        if not drug_name or not smiles:
-            return {
-                "ok": False,
-                "run_id": run_id2,
-                "error": "Could not extract drug name from LLM response",
-                "extraction_output": extraction_result.get("output", "")[:500],
+            # Run extraction - LLM discovers drug name, UniProt ID, FASTA, SMILES
+            human_prompt = f"Suggest the potential drug molecules for {disease} targeting the protein {protein}."
+            input_data = {
+                "input": human_prompt,
+                "tools": tools,
+                "tool_names": tool_names,
+                "tool_desc": tool_desc,
             }
+        
+            extraction_result = extraction_agent.invoke(input_data)
+            progress.update("extraction", {"substep": "llm_extraction_completed"})
+        
+            # Save full extraction response (same as notebook)
+            from agentD.utils import custom_serializer  # type: ignore
+            with open(run_dir / "extraction_response.json", "w", encoding="utf-8") as f:
+                json.dump(extraction_result, f, indent=2, default=custom_serializer)
+        
+            # Extract data from agent's intermediate steps (same approach as notebook)
+            # The agent uses tools: get_uniprot_ids, fetch_uniprot_fasta, search, get_drug_smiles
+            # Each step is [action, observation] where action can be an object or string
+            import re
+        
+            drug_name = None
+            smiles = None
+            uniprot_id = None
+            fasta = None
+        
+            # Parse intermediate steps to get the data the agent retrieved
+            if "intermediate_steps" in extraction_result:
+                for step in extraction_result.get("intermediate_steps", []):
+                    if len(step) >= 2:
+                        action = step[0]
+                        observation = step[1]
+                    
+                        # Action can be an object with .tool/.tool_input or a string
+                        tool_name = None
+                        tool_input = None
+                    
+                        if hasattr(action, 'tool'):
+                            tool_name = action.tool
+                            tool_input = action.tool_input
+                        elif isinstance(action, str):
+                            # Parse from string like "tool='get_drug_smiles' tool_input='Venetoclax'..."
+                            tool_match = re.search(r"tool='([^']+)'", action)
+                            input_match = re.search(r"tool_input='([^']+)'", action)
+                            if tool_match:
+                                tool_name = tool_match.group(1)
+                            if input_match:
+                                tool_input = input_match.group(1)
+                    
+                        if tool_name == "get_uniprot_ids" and observation:
+                            # Parse UniProt ID from observation like [['P10415', 'Apoptosis regulator Bcl-2']]
+                            if isinstance(observation, list) and len(observation) > 0:
+                                first = observation[0]
+                                if isinstance(first, (list, tuple)) and len(first) > 0:
+                                    uniprot_id = first[0]
+                                elif isinstance(first, str):
+                                    uniprot_id = first
+                            elif isinstance(observation, str) and "P" in observation:
+                                match = re.search(r"['\"]([A-Z][0-9A-Z]{4,})['\"]", observation)
+                                if match:
+                                    uniprot_id = match.group(1)
+                    
+                        elif tool_name == "fetch_uniprot_fasta" and observation:
+                            # FASTA sequence returned
+                            fasta = observation if isinstance(observation, str) else str(observation)
+                    
+                        elif tool_name == "get_drug_smiles" and observation:
+                            # Drug name is the input, SMILES is the observation
+                            drug_name = tool_input
+                            if isinstance(observation, str) and len(observation) > 10:
+                                smiles = observation
+        
+            # Fallback: use retrieval tools directly if agent didn't get all data
+            from agentD.tools import retrieval as R
+        
+            if not uniprot_id:
+                ids = R.get_uniprot_ids.invoke({"protein_name": protein})
+                if isinstance(ids, str) or not ids:
+                    return {"ok": False, "run_id": run_id2, "error": f"UniProt lookup failed: {ids}"}
+                uniprot_id = ids[0][0]
+        
+            if not fasta:
+                fasta = R.fetch_uniprot_fasta.invoke({"uniprot_id": uniprot_id}) or ""
+        
+            seq = _parse_fasta_to_sequence(fasta)
+        
+            # Fallback for drug name: parse from output text if not found in steps
+            if not drug_name or not smiles:
+                output_text = extraction_result.get("output", "")
+            
+                # Try common patterns like "Venetoclax" (drug names typically capitalized)
+                patterns = [
+                    r"([A-Z][a-z]+(?:inib|mab|nib|zole|tide|stat|clax|lib|zumab))\b",  # Common drug suffixes
+                    r"drug[:\s]+([A-Z][a-z]+)",
+                    r"found\s+([A-Z][a-z]+)",
+                    r"identified\s+([A-Z][a-z]+)",
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, output_text)
+                    if match:
+                        potential_drug = match.group(1).strip()
+                        # Verify it's a real drug by trying to get SMILES from ChEMBL
+                        test_smiles = R.get_drug_smiles.invoke({"drug_name": potential_drug})
+                        if test_smiles and len(test_smiles) > 10:
+                            drug_name = potential_drug
+                            smiles = test_smiles
+                            break
+        
+            if not drug_name or not smiles:
+                return {
+                    "ok": False,
+                    "run_id": run_id2,
+                    "error": "Could not extract drug name from LLM response",
+                    "extraction_output": extraction_result.get("output", "")[:500],
+                }
 
-        extraction = {
-            "protein": protein,
-            "disease": disease,
-            "uniprot_id": uniprot_id,
-            "fasta": seq,
-            "drug_name": drug_name,
-            "SMILES": smiles,
-        }
-        _safe_json_dump(run_dir / "extraction.json", extraction)
-        progress.update("extraction", {
-            "substep": "completed",
-            "uniprot_id": uniprot_id,
-            "drug_name": drug_name,
-            "smiles": smiles[:50] + "...",
-        })
+            extraction = {
+                "protein": protein,
+                "disease": disease,
+                "uniprot_id": uniprot_id,
+                "fasta": seq,
+                "drug_name": drug_name,
+                "SMILES": smiles,
+            }
+            _safe_json_dump(run_dir / "extraction.json", extraction)
+            progress.update("extraction", {
+                "substep": "completed",
+                "uniprot_id": uniprot_id,
+                "drug_name": drug_name,
+                "smiles": smiles[:50] + "...",
+            })
 
         # --- Pooling (REINVENT) ---
         progress.update("pooling", {"substep": "running_reinvent", "num_smiles": num_smiles})
@@ -1159,17 +1177,25 @@ def _make_mcp():
         )
         progress.update("pooling", {"substep": "completed", "ok": pool_result.get("ok", False)})
         _safe_json_dump(run_dir / "pooling_result.json", pool_result)
+        if not pool_result.get("ok"):
+            progress.update("pipeline_failed", {"error": "REINVENT pooling failed"})
+            return {"ok": False, "run_id": run_id2, "run_dir": str(run_dir), "error": "REINVENT pooling failed", "pooling": pool_result}
+
 
         pool_dir = run_dir / "pool"
         reinvent_csv = pool_dir / "Reinvent_sampling.csv"
         mol2mol_csv = pool_dir / "Mol2Mol_sampling.csv"
 
-        if reinvent_csv.exists() or mol2mol_csv.exists():
+        if reinvent_csv.exists() and mol2mol_csv.exists():
             current_smiles_csv = pool_dir / "combined_candidates.csv"
             _combine_pool_csvs(pool_dir, current_smiles_csv)
+            # Preserve the separate prediction/optimization candidate-ID contract.
+            from agentD.optimization import identify
+            import pandas as pd
+            identify(pd.read_csv(current_smiles_csv)).to_csv(current_smiles_csv, index=False)
         else:
-            current_smiles_csv = pool_dir / "seed.csv"
-            _write_smiles_csv(smiles, current_smiles_csv)
+            progress.update("pipeline_failed", {"error": "REINVENT output CSV missing"})
+            return {"ok": False, "run_id": run_id2, "run_dir": str(run_dir), "error": "REINVENT output CSV missing"}
 
         # --- Iterative loop ---
         artifacts: Dict[str, Any] = {
@@ -1231,6 +1257,10 @@ def _make_mcp():
                 "admet_status": job_statuses[job_admet.job_id].get("status"),
             })
 
+            if any(status.get("returncode") != 0 for status in job_statuses.values()):
+                artifacts["iterations"].append({"iter": i, "jobs": job_statuses, **_failed_iteration(smiles_csv_iter, iter_dir, "Baseline prediction worker failed")})
+                break
+
             affinity_out, admet_out = _find_prediction_outputs(iter_dir, smiles_csv_iter.name)
 
             if not admet_out or not admet_out.exists():
@@ -1246,7 +1276,7 @@ def _make_mcp():
                 artifacts["iterations"].append({
                     "iter": i,
                     "ok": False,
-                    "error": "ADMET prediction required but failed. See errors/missing_admet.json",
+                    **_failed_iteration(smiles_csv_iter, iter_dir, "ADMET prediction output missing"),
                 })
                 break
 
@@ -1263,7 +1293,7 @@ def _make_mcp():
                 artifacts["iterations"].append({
                     "iter": i,
                     "ok": False,
-                    "error": "Affinity prediction failed. See errors/missing_affinity.json",
+                    **_failed_iteration(smiles_csv_iter, iter_dir, "Affinity prediction output missing"),
                 })
                 break
 
@@ -1282,86 +1312,23 @@ def _make_mcp():
 
             progress.update(f"iteration_{i}_scoring", {"substep": "completed"})
 
-            progress.update(f"iteration_{i}_refinement", {"substep": "starting_llm_refinement"})
-            refinement_dir = iter_dir / "refinement"
-            refinement_dir.mkdir(parents=True, exist_ok=True)
-            refinement_csv = refinement_dir / "refinement.csv"
-            
-            _refine_smiles(smiles_csv_iter, refinement_csv, protein=protein, model=model)
-            progress.update(f"iteration_{i}_refinement", {"substep": "completed"})
-
-            if is_last_iteration:
-                updated_smiles_csv = refinement_dir / "updated_smiles_temp.csv"
-                _extract_updated_smiles(refinement_csv, updated_smiles_csv)
-                progress.update(f"iteration_{i}_after_prediction", {
-                    "substep": "starting_after_predictions",
-                })
-
-                job_aff_after, job_admet_after = _run_prediction_jobs(
-                    jm=jm,
-                    iter_dir=iter_dir,
-                    smiles_csv=updated_smiles_csv,
-                    seq=seq,
-                    iteration=i,
-                    suffix="_after",
-                )
-
-                job_statuses_after = _wait_for_jobs(
-                    jm=jm,
-                    job_ids=[job_aff_after.job_id, job_admet_after.job_id],
-                    progress=progress,
-                    progress_key=f"iteration_{i}_after_prediction",
-                )
-
-                affinity_after, admet_after = _find_prediction_outputs(iter_dir, updated_smiles_csv.name)
-
-                if affinity_after and affinity_after.exists():
-                    shutil.copy(affinity_after, prop_dir / "affinity_after.csv")
-                if admet_after and admet_after.exists():
-                    shutil.copy(admet_after, prop_dir / "admet_after.csv")
-
-                progress.update(f"iteration_{i}_after_prediction", {
-                    "substep": "completed",
-                    "affinity_after_exists": (prop_dir / "affinity_after.csv").exists(),
-                    "admet_after_exists": (prop_dir / "admet_after.csv").exists(),
-                })
-
-            if is_last_iteration:
-                _cleanup_intermediate_files(prop_dir, [
-                    "affinity_before.csv", "admet_before.csv",
-                    "affinity_after.csv", "admet_after.csv",
-                ])
-            else:
-                _cleanup_intermediate_files(prop_dir, [
-                    "affinity.csv", "admet.csv",
-                ])
-            
-            _cleanup_intermediate_files(refinement_dir, ["refinement.csv"])
-
+            round_result = _optimize_iteration(
+                candidates_csv=smiles_csv_iter, affinity_csv=final_affinity, admet_csv=final_admet,
+                iter_dir=iter_dir, sequence=seq, protein=protein, model=model,
+                jm=jm, progress=progress, iteration=i,
+            )
+            refinement_csv = Path(round_result["refinement_csv"]) if round_result.get("refinement_csv") else None
             iter_artifact = {
-                "iter": i,
-                "ok": True,
-                "is_last": is_last_iteration,
-                "input_smiles_csv": str(smiles_csv_iter),
-                "affinity_job": job_aff.__dict__,
-                "admet_job": job_admet.__dict__,
-                "refinement_csv": str(refinement_csv),
+                "iter": i, "is_last": is_last_iteration, "input_smiles_csv": str(smiles_csv_iter),
+                "affinity_job": job_aff.__dict__, "admet_job": job_admet.__dict__,
+                "affinity_before_csv": str(final_affinity), "admet_before_csv": str(final_admet),
+                "affinity_after_csv": str(prop_dir / "affinity_after.csv"),
+                "admet_after_csv": str(prop_dir / "admet_after.csv"), **round_result,
             }
 
-            if is_last_iteration:
-                iter_artifact.update({
-                    "affinity_before_csv": str(prop_dir / "affinity_before.csv"),
-                    "admet_before_csv": str(prop_dir / "admet_before.csv"),
-                    "affinity_after_csv": str(prop_dir / "affinity_after.csv"),
-                    "admet_after_csv": str(prop_dir / "admet_after.csv"),
-                })
-            else:
-                iter_artifact.update({
-                    "affinity_csv": str(prop_dir / "affinity.csv"),
-                    "admet_csv": str(prop_dir / "admet.csv"),
-                })
-
             artifacts["iterations"].append(iter_artifact)
+            if not round_result["ok"]:
+                break
 
             # Next iteration input - extract updated SMILES from refinement.csv
             # This creates a temp file that will be copied to next iter's pool/candidates.csv
@@ -1512,16 +1479,19 @@ def _make_mcp():
                     progress.update("boltz", {"substep": "no_candidates_passed_filters"})
 
         artifacts["boltz"] = {"yamls": boltz_yamls, "jobs": boltz_jobs}
-        progress.update("pipeline_complete", {"total_iterations": len(artifacts["iterations"])})
-        _safe_json_dump(run_dir / "summary.json", {"ok": True, **artifacts})
-        return {"ok": True, **artifacts}
+        ok = len(artifacts["iterations"]) == total_iterations and all(it.get("ok", False) for it in artifacts["iterations"])
+        if run_boltz and any(job.get("status") == "failed" for job in boltz_jobs):
+            ok = False
+        progress.update("pipeline_complete" if ok else "pipeline_failed", {"total_iterations": len(artifacts["iterations"])})
+        _safe_json_dump(run_dir / "summary.json", {"ok": ok, **artifacts})
+        return {"ok": ok, **artifacts}
 
     @mcp.tool
     def agentd_qna(
         question: str,
         protein: Optional[str] = None,
         disease: Optional[str] = None,
-        model: str = "gpt-4o",
+        model: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -1532,7 +1502,7 @@ def _make_mcp():
         - question: The question to answer (use "_init_papers_" to just download papers)
         - protein: Target protein name (for paper search)
         - disease: Disease name (for paper search)
-        - model: LLM model (default "gpt-4o")
+        - model: LLM model (default "deepseek-flash")
         - run_id: Run ID for storing papers (creates new if not provided)
 
         If protein and disease are provided, relevant papers will be downloaded
@@ -1540,6 +1510,8 @@ def _make_mcp():
 
         This is a standalone mode separate from the full pipeline.
         """
+        model = model or load_runtime().model
+        configure_runtime({'model':model})
         _load_api_keys_fallback()
         _ensure_agentd_importable()
 
@@ -1584,7 +1556,7 @@ def _make_mcp():
             
             # Download papers if protein/disease specified and papers dir is empty
             papers_downloaded = []
-            existing_papers = list(papers_dir.glob("*.pdf"))
+            existing_papers = list(papers_dir.glob("*.pdf")) + list(papers_dir.glob("*.md"))
             if protein and disease and not existing_papers:
                 try:
                     query = f"{disease} {protein} treatment therapy year: \"2022-\""
@@ -1783,7 +1755,7 @@ def main() -> int:
 
         qna_agent = AgentDClass(
             tools,
-            model="gpt-4o",
+            model="deepseek-flash",
             prefix=PREFIX,
             suffix=SUFFIX,
             format_instructions=FORMAT_INSTRUCTIONS,
@@ -1819,17 +1791,14 @@ def main() -> int:
 
         return 0
 
-    # Server entrypoint (stdio)
-    # Suppress stderr to prevent library warnings from breaking MCP JSON-RPC protocol
-    import io
-    import warnings
-    warnings.filterwarnings("ignore")
-    sys.stderr = io.StringIO()  # Redirect stderr to null
-    
-    _load_api_keys_fallback()
-    mcp = _make_mcp()
-    # show_banner=False is critical for stdio transport - banner output breaks JSON-RPC protocol
-    mcp.run(show_banner=False)
+    # stdout is protocol-only; isolate it before creating tools or loading keys.
+    from agentD.mcp_stdio import run_stdio
+
+    def server_factory():
+        _load_api_keys_fallback()
+        return _make_mcp()
+
+    run_stdio(server_factory)
     return 0
 
 

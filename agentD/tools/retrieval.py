@@ -1,3 +1,5 @@
+import logging
+import re
 # Built-in and standard library
 import os
 import time
@@ -8,12 +10,12 @@ from collections import defaultdict
 # Third-party libraries (LangChain, ChEMBL)
 from langchain.tools import tool
 from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.chat_models import ChatOpenAI
+from agentD.providers.deepseek import get_chat_model
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.embeddings import OpenAIEmbeddings
-from langchain_community.utilities import GoogleSerperAPIWrapper
+from agentD.local_embeddings import get_embeddings, split_documents
+from agentD.providers.deepseek_search import DeepSeekSearch
+from agentD.documents import collect_documents,load_documents
 from langchain_community.vectorstores import FAISS
-from chembl_webresource_client.new_client import new_client
 # Local utilities
 from agentD.utils import download_pdf, RetrievalQABypassTokenLimit
 from configs.tool_globals import UNIPROT_NUM_IDS, MAX_PAPERS, EMBEDDING_MODEL, PAPER_DIR
@@ -25,13 +27,15 @@ from configs.tool_globals import UNIPROT_NUM_IDS, MAX_PAPERS, EMBEDDING_MODEL, P
 
 @tool
 def search(query):
-    '''
-    This tool performs a search on Google using SerpAPI and returns relevant information for the query.
-    It is particularly used for identifying existing drug molecules associated with a specific target protein.
-    '''
-    search = GoogleSerperAPIWrapper(engine='google', serpapi_api_key=os.getenv("SERPER_API_KEY"))
-    results = search.run(query)
-    return results
+    """Search current webpages using DeepSeek; query must contain 1–128 characters. Returns titles, URLs and labeled source text."""
+    hits=DeepSeekSearch().search(query)
+    from agentD.call_budget import current_budget
+    if current_budget():
+        hits = [{"title": hit["title"], "url": hit["url"],
+                 "text": (hit["content"] or hit["summary"] or hit["snippet"])[:1500],
+                 "excerpt_limit_characters": 1500} for hit in hits]
+    return json.dumps(hits,ensure_ascii=False)
+
 
 @tool
 def get_uniprot_ids(protein_name: str):
@@ -54,13 +58,25 @@ def get_uniprot_ids(protein_name: str):
     #print(f"Sending API request: {base_url}?query={query}&format=json&size={size}")  # Debugging output
 
     try:
-        response = requests.get(base_url, params=params)
+        response = requests.get(base_url, params=params, timeout=(10, 60))
         response.raise_for_status()  # Raise an error for HTTP failures
         data = response.json()
 
         if "results" in data and len(data["results"]) > 0:
             #return data['results'][0]['primaryAccession'] #[entry["primaryAccession"] for entry in data["results"]][0]  # Return the first UniProt ID
-            return [(d["primaryAccession"], d['proteinDescription']['recommendedName']['fullName']['value']) for d in data["results"] if "primaryAccession" in d]
+            matches = []
+            for entry in data["results"]:
+                accession = entry.get("primaryAccession")
+                if not accession:
+                    continue
+                description = entry.get("proteinDescription") or {}
+                names = [description.get("recommendedName") or {}]
+                names.extend(description.get("submissionNames") or [])
+                name = next((item.get("fullName", {}).get("value")
+                             for item in names
+                             if item.get("fullName", {}).get("value")), accession)
+                matches.append((accession, name))
+            return matches
         else:
             return f"No UniProt IDs found for '{protein_name}'."
 
@@ -72,13 +88,26 @@ def fetch_uniprot_fasta(uniprot_id):
     """
     Fetch the FASTA sequence using the UniProt ID.
     """
+    import re
+
+    if not isinstance(uniprot_id, str):
+        raise ValueError("UniProt accession must be a string")
+    uniprot_id = uniprot_id.strip()
+    uniprot_id = uniprot_id.strip('"')
+    uniprot_id = uniprot_id.strip()
+    accession_pattern = (
+        r"(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})"
+        r"(?:-[1-9][0-9]*)?"
+    )
+    if not re.fullmatch(accession_pattern, uniprot_id):
+        raise ValueError("Invalid UniProt accession")
     fasta_url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.fasta"
-    response = requests.get(fasta_url)
+    response = requests.get(fasta_url, timeout=(10, 60))
     
     if response.status_code == 200:
         return response.text
     else:
-        print(f"Failed to fetch FASTA for {uniprot_id}. Status Code: {response.status_code}")
+        logging.getLogger(__name__).warning(f"Failed to fetch FASTA for {uniprot_id}. Status Code: {response.status_code}")
         return None
 
 
@@ -90,8 +119,6 @@ def save_results(input_str: str) -> str:
     
     try:
         input_str = input_str.strip()
-        if '\n' in input_str:  # Check if the input string contains newlines
-            input_str - input_str.replace('\n', '')
         data = json.loads(input_str)
         filename = "extraction.json" #data["save_name"]+".json"
   
@@ -110,166 +137,81 @@ def save_results(input_str: str) -> str:
         return f"Failed to write file: {e}"
 
 
+def _load_chembl_client():
+    # One retry loop owns failures, including the import-time /spore request.
+    from chembl_webresource_client.settings import Settings
+    settings = Settings.Instance()
+    settings.TOTAL_RETRIES = 0
+    settings.NEW_CLIENT_TIMEOUT = (10, 30)
+    from chembl_webresource_client.new_client import new_client
+    return new_client
+
+
 @tool
 def get_drug_smiles(drug_name: str):
     """
-    Fetch the drug molecule SMILES of a given drug name from ChEMBL.
+    Fetch canonical SMILES for one drug name from ChEMBL, or None if not found.
     """
-    molecule = new_client.molecule
-    mols = molecule.filter(pref_name__iexact=drug_name)
-
-    matching_mols = defaultdict(list)
-    
-    for mol in mols:
-        if 'molecule_structures' in mol and mol['molecule_structures']:
-            matching_mols[mol['molecule_chembl_id']].append(mol['molecule_structures']['canonical_smiles'])
-
-    if not matching_mols:
-        print(f"No SMILES found for {drug_name}.")
-        return None, None
-    
-    # Get the first match as the anchor molecule
-    anchor_chembl_id = list(matching_mols.keys())[0]
-    anchor_smiles = matching_mols[anchor_chembl_id][0]
-    
-    return anchor_smiles
+    # ReAct action inputs may retain trailing newlines or enclosing quotes.
+    drug_name = drug_name.strip()
+    if len(drug_name) >= 2 and drug_name[0] == drug_name[-1] and drug_name[0] in ('"', "'"):
+        drug_name = drug_name[1:-1].strip()
+    if not drug_name or '\n' in drug_name or '\r' in drug_name:
+        raise ValueError('drug_name must contain one non-empty drug name')
+    logger = logging.getLogger(__name__)
+    max_attempts = 6  # Initial attempt followed by at most five retries.
+    for attempt in range(1, max_attempts + 1):
+        logger.warning('ChEMBL client lookup attempt=%s/6 event=started', attempt)
+        try:
+            client = _load_chembl_client()
+            mols = client.molecule.filter(pref_name__iexact=drug_name)
+            # The SDK fetches records lazily, so iteration must be retried too.
+            smiles = None
+            for mol in mols:
+                structures = mol.get('molecule_structures') or {}
+                candidate = structures.get('canonical_smiles')
+                if isinstance(candidate, str) and candidate.strip():
+                    smiles = candidate
+                    break
+        except Exception as error:
+            status = getattr(getattr(error, 'response', None), 'status_code', None)
+            if status is None:
+                match = re.search(r'\bstatus\s+(\d{3})\b', str(error))
+                status = match.group(1) if match else None
+            logger.warning('ChEMBL client lookup attempt=%s/6 event=failed status=%s error_type=%s',
+                           attempt, status, type(error).__name__)
+            if attempt == max_attempts:
+                detail = f'HTTP {status}' if status is not None else type(error).__name__
+                raise RuntimeError(
+                    f'ChEMBL client lookup failed after 6 attempts '
+                    f'(initial attempt + 5 retries; last error: {detail})'
+                ) from None
+            logger.warning('ChEMBL client lookup retry=%s/5 delay_s=2', attempt)
+            time.sleep(2)
+        else:
+            logger.warning('ChEMBL client lookup attempt=%s/6 event=completed', attempt)
+            if smiles is None:
+                logger.warning('No SMILES found for %s.', drug_name)
+            return smiles
 
 
 
 
 @tool
 def question_answering(query: str):
-    '''
-    This tool performs question and answering using the downloaded research papers through a Retrieval-Augmented Generation (RAG) approach.
-    It constructs a vector storage of all document embeddings and then performs retrieval and response generation using the provided query.
-    '''
-    # check if the files exist in the directory
-    if not os.path.exists(PAPER_DIR):
-        return "No papers found in the directory. Use generic design guidelines instead."
+    """Answer a question using locally downloaded PDFs/Markdown and local embeddings; cite available source URLs."""
+    if not os.path.isdir(PAPER_DIR):
+        return "No papers found. Collect source documents first."
+    documents=load_documents(PAPER_DIR)
+    if not documents:
+        return "No readable source documents found."
+    vectorstore=FAISS.from_documents(split_documents(documents),get_embeddings())
+    result=RetrievalQABypassTokenLimit(vectorstore,query,get_chat_model(temperature=0.3),return_sources=True)
+    sources=sorted({str(meta.get('source','')) for meta in result['sources']})
+    return json.dumps({'answer':result['answer'],'available_sources':sources,'retrieved_sources':result['sources']},ensure_ascii=False)
 
-    documents = []
-    # Iterate over the downloaded papers
-    for paper_file in os.listdir(PAPER_DIR):
-        # Check if the file is a PDF
-        if not paper_file.endswith('.pdf'):
-            continue
-
-        # Construct the full file path
-        paper_file_path = os.path.join(PAPER_DIR, paper_file)
-        try:
-            text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
-            pages = PyPDFLoader(paper_file_path).load_and_split()
-            sliced_pages = text_splitter.split_documents(pages)
-            documents.extend(sliced_pages)
-        except Exception as e:
-            print(f"Error processing {paper_file_path}: {e}")
-            continue
-
-    # Construct VectorStore only once
-    try:
-        if documents:
-            faiss_vectorstore = FAISS.from_documents(documents, OpenAIEmbeddings(model=EMBEDDING_MODEL))
-            llm = ChatOpenAI(model_name='gpt-4o', temperature=0.3)
-            response = RetrievalQABypassTokenLimit(faiss_vectorstore, query, llm)
-            # Perform RAG for the query
-            #response = retriever(query)
-            return response
-        else:
-            return "No valid documents found to construct vector storage."
-    except Exception as e:
-        print(f"Error constructing vector store or during retrieval: {e}")
-        return "Error in retrieval process."
 
 @tool
 def download_relevant_papers(query: str):
-    """
-    Searches for and downloads relevant academic papers related to a given research query.
-    This function uses the Semantic Scholar API to search for papers and download them if they are open access.
-    Query should be constructed in a way that it can be used to search for relevant papers.
-    **Example Usage:**
-        download_relevant_papers("drug molecule for <<target protein>>", year: "2023-")
-        do not use year unless it is specified in instructions.
-    """
-    import re
-    
-    print(f"Searching for papers on: {query}")
-
-    papers_downloaded = []
-    print(f"Searching for papers on: {query}")
-
-    # Parse year from query string (e.g., year: "2023-")
-    year_match = re.search(r'year:\s*"([^"]+)"', query, re.IGNORECASE)
-    if year_match:
-        year = year_match.group(1)
-    else:
-        year = None
-
-    # Step 1: Search Semantic Scholar
-    SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
-    headers = {"x-api-key": "P5pZs85BTC4MGCCNIQaDPaO2ktEIVZI08JKKBTox"}  # Replace with a valid API key
-
-    # params = {
-    #     "query": query,
-    #     "fields": "title,url,abstract,isOpenAccess,openAccessPdf",
-    #     "limit": MAX_PAPERS,
-    #     "sort": "citationCount:desc"
-    # }
-
-    params = {
-    "query": query,
-    "fields": "title,url,abstract,isOpenAccess,openAccessPdf",
-    "limit": MAX_PAPERS
-    }
-
-    # Only add year if parsed from query
-    if year:
-        params["year"] = year
-
-    MAX_RETRIES = 3
-    RETRY_WAIT = 5  # seconds
-
-    response = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = requests.get(
-                SEMANTIC_SCHOLAR_API, headers=headers, params=params, timeout=30
-            )
-            if response.status_code == 200:
-                break
-
-            print(
-                f"Error fetching papers from Semantic Scholar. Status Code: {response.status_code}. "
-                f"Attempt {attempt}/{MAX_RETRIES}"
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_WAIT)
-        except requests.exceptions.RequestException as e:
-            print(
-                f"Error fetching papers from Semantic Scholar. Error: {e}. "
-                f"Attempt {attempt}/{MAX_RETRIES}"
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_WAIT)
-
-    if response is not None and response.status_code == 200:
-        try:
-            results = response.json().get("data", [])
-        except ValueError as e:
-            print(f"Error parsing Semantic Scholar response JSON: {e}")
-            return papers_downloaded
-
-        for paper in results:
-            title = paper.get("title", "Untitled")  # Default to 'Untitled' if title is missing
-            open_access_pdf = paper.get("openAccessPdf")  # Get the dictionary (could be None)
-
-            if isinstance(open_access_pdf, dict):  # Ensure it's a dictionary
-                pdf_url = open_access_pdf.get("url")
-                if pdf_url:
-                    file_path = download_pdf(pdf_url, title, PAPER_DIR)
-                    if file_path:
-                        papers_downloaded.append(file_path)
-                    time.sleep(2)
-    else:
-        print("Error fetching papers from Semantic Scholar after retries.")
-
-    return papers_downloaded
+    """Find relevant literature through DeepSeek Search and save accessible PDF/web text with source links. Query must be <=128 characters."""
+    return collect_documents(query,PAPER_DIR,DeepSeekSearch(),max_papers=MAX_PAPERS)

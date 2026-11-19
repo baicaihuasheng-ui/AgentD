@@ -2,3 +2,12 @@
 _tools.py
 examples/*
 */secret_keys.py
+.env*
+!.env.deepseek.example
+.superpowers/
+reports/
+runs/
+*.egg-info/
+.pytest_cache/
+__pycache__/
+runtime.local.json

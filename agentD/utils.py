@@ -1,3 +1,4 @@
+import logging
 from agentD import tools
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import RetrievalQA
@@ -11,33 +12,41 @@ import importlib.util
 import pandas as pd
 
 # from dZiner paper
-def RetrievalQABypassTokenLimit(vector_store, RetrievalQA_prompt, llm, k=10, fetch_k=50, min_k=2, chain_type="stuff"):
+def RetrievalQABypassTokenLimit(vector_store, RetrievalQA_prompt, llm, k=10, fetch_k=50, min_k=2, chain_type="stuff", return_sources=False):
     while k >= min_k:
         try:
             retriever = vector_store.as_retriever(
                 search_type="mmr",
                 search_kwargs={"k": k, "fetch_k": fetch_k},
             )
-            qa_chain = RetrievalQA.from_chain_type( 
+            from langchain_core.prompts import PromptTemplate
+            chain_kwargs={}
+            if chain_type == 'stuff':
+                chain_kwargs['document_prompt']=PromptTemplate.from_template('Source: {source}\nPage: {page_number}\n{page_content}')
+            qa_chain = RetrievalQA.from_chain_type(
                 llm=llm,
                 chain_type=chain_type,
                 retriever=retriever,
-                memory=ConversationBufferMemory(
-                        ))
+                return_source_documents=True,
+                chain_type_kwargs=chain_kwargs,
+                memory=ConversationBufferMemory(input_key='query',output_key='result'))
             
             # Check to see if we hit the token limit
-            result = qa_chain.run({"query": RetrievalQA_prompt})
-            return result  # If successful, return the result and exit the function
+            result = qa_chain.invoke({"query": RetrievalQA_prompt})
+            if return_sources:
+                return {'answer':result['result'],'sources':[d.metadata for d in result['source_documents']]}
+            return result['result']
 
         except OpenAIError as e:
             # Check if it's a token limit error
-            print(e)
+            logging.getLogger(__name__).warning(f'Language model request failed: {type(e).__name__}')
             if 'maximum context length' in str(e):
-                print(f"\nk={k} results hitting the token limit. Reducing k and retrying...\n")
+                logging.getLogger(__name__).warning(f"\nk={k} results hitting the token limit. Reducing k and retrying...\n")
                 k -= 1
             else:
                 # Re-raise other OpenAI errors
                 raise e
+    raise ValueError('Retrieved context does not fit within the model context limit')
             
 
 def download_pdf(url: str, title: str, paper_dir: str):
@@ -68,11 +77,11 @@ def download_pdf(url: str, title: str, paper_dir: str):
             # print(f"Downloaded: {file_path}")
             return file_path
         else:
-            print(f"Failed to download: {title} ({url})")
+            logging.getLogger(__name__).warning(f"Failed to download: {title} ({url})")
             return None#f"Failed to download: {title} ({url})"
         #     pass
     except Exception as e:
-        print(f"Error downloading {title}: {str(e)}")
+        logging.getLogger(__name__).warning(f"Error downloading {title}: {str(e)}")
         return None #f"Error downloading {title}: {str(e)}"
     
 
@@ -143,47 +152,39 @@ def process_dataset_with_agent(file_path: str, protein: str, tools: list, agent)
     Returns:
         pd.DataFrame: DataFrame with the original data and LLM assessments.
     """
-    # Read dataset
-    df = pd.read_csv(file_path)
-
-    # Prepare list to store output
+    from agentD.optimization import identify, canonical
+    from agentD.call_budget import BudgetExceeded
+    from agentD.providers.deepseek import DeepSeekCallError
+    df = identify(pd.read_csv(file_path))
     results = []
-
-    # Iterate through each row
+    stop_error = None
     for _, row in df.iterrows():
-
-        entry = row.to_dict()
-
-        keys_to_remove = [key for key in entry.keys() if "Probability" in key or "Interpretation" in key]
-        for key in keys_to_remove:
-            entry.pop(key, None)
-
-        smiles = row['SMILES']
+        record = {"candidate_id": row.candidate_id, "SMILES": row.SMILES,
+                  "Updated_SMILES": "", "Property": "", "Rationale": "", "status": "failed", "error": ""}
+        if stop_error:
+            record["error"] = stop_error
+            results.append(record)
+            continue
         prompt = (
-            f"Propose a modified version of the given SMILES that addresses its weakness as a drug candidate. "
-            f"Consider that the given molecule is targeting {protein}. "
-            f"The molecule's properties are: {entry}."
+            f"Propose one structural modification targeting {protein}, based on these measured predictions and confidences: "
+            f"{row.to_dict()}. Return modified SMILES</s>exact property name</s>brief rationale. "
+            "Use supplied prediction values. Keep the original molecule if no valid modification is available."
         )
-
-        tool_names = [tool.name for tool in tools]  
-        tool_desc = [tool.description for tool in tools]
-        input_data = {
-            "input": prompt,
-            "tools": tools,
-            "tool_names": tool_names,
-            "tool_desc": tool_desc
-        }
-        
         try:
-            response = agent.invoke(input_data)
-            assessment = response.get('output', 'No response')
-
-            updated_smiles, property, rationale = assessment.split('</s>')
-            results.append({'SMILES': smiles, 'Updated_SMILES': updated_smiles,'Property': property, 'Rationale': rationale})
-
-        except Exception as e:
-            assessment = f"Error: {str(e)}"
-
-    # Create and return the new DataFrame
+            response = agent.invoke({"input": prompt, "tools": tools,
+                                     "tool_names": [tool.name for tool in tools],
+                                     "tool_desc": [tool.description for tool in tools]})
+            parts = response.get("output", "").strip().split("</s>")
+            if len(parts) != 3 or not all(part.strip() for part in parts):
+                raise ValueError("Expected SMILES, property and rationale separated by </s>")
+            updated, property_name, rationale = [part.strip() for part in parts]
+            changed = canonical(updated) != canonical(row.SMILES)
+            record.update(Updated_SMILES=updated, Property=property_name, Rationale=rationale,
+                          status="modified" if changed else "unchanged")
+        except (BudgetExceeded, DeepSeekCallError) as error:
+            stop_error = type(error).__name__
+            record["error"] = stop_error
+        except Exception as error:
+            record["error"] = type(error).__name__
+        results.append(record)
     return pd.DataFrame(results)
-

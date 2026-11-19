@@ -1,4 +1,6 @@
 import unittest
+from unittest.mock import patch
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain.tools import tool
 from agentD.agents import agentD
 
@@ -8,12 +10,13 @@ class TestImports(unittest.TestCase):
         def dummy_tool(input: str) -> str:
             """A dummy tool for testing."""
             return "ok"
-        agent = agentD(
-            tools=[dummy_tool],
-            prefix="Test prefix",
-            format_instructions="Test format instructions",
-            suffix="Test suffix"
-        )
+        with patch('agentD.agents.get_chat_model',return_value=FakeListChatModel(responses=['Final Answer: offline'])):
+            agent = agentD(
+                tools=[dummy_tool],
+                prefix="Test prefix",
+                format_instructions="Test format instructions",
+                suffix="Test suffix"
+            )
         self.assertIsNotNone(agent)
 
     def test_import_tools(self):

@@ -1,7 +1,7 @@
 # AgentD Pipeline Configuration
 # Usage: conda run -n agentd python run_agentd.py --config pipeline_config.yaml
 run_id: "BCL2_pipeline"
-model: "gpt-4o"
+model: "deepseek-flash"
 
 protein: "BCL-2"
 disease: "chronic lymphocytic leukemia"

@@ -1,7 +1,10 @@
 from langchain.tools import tool
 import json, yaml, os, subprocess
+import sys
+import re
 from langchain.prompts import PromptTemplate
-from langchain_community.chat_models import ChatOpenAI  # or your preferred provider (e.g., Ollama, HuggingFaceHub)
+from agentD.providers.deepseek import get_chat_model
+from agentD.runtime_config import load_runtime, reinvent_command
 from langchain.chains import LLMChain
 import torch
 from configs.tool_globals import POOL_PATH, REINVENT_PATH
@@ -18,7 +21,7 @@ def update_reinvent_config(model_type: str = "Reinvent"): #
         Currently, only "Reinvent" and "Mol2Mol" are supported in the agentD framework.
     """
     # Fixed input TOML path
-    prefix = REINVENT_PATH
+    prefix = load_runtime().reinvent_path.as_posix()
     pool_path = POOL_PATH
     input_path = os.path.join(prefix, "configs", "toml", "sampling.toml")
     # Read original TOML content
@@ -49,11 +52,15 @@ TOML:
 )
 
     # Initialize LLM (swap this if you're using Ollama, HuggingFace, etc.)
-    llm = ChatOpenAI(model_name='gpt-4o', temperature=0.0)
+    llm = get_chat_model(temperature=0.0)
     chain = LLMChain(prompt=prompt_template, llm=llm)
 
     # Get updated TOML content
     updated_toml = chain.run(toml=toml_text, prefix=prefix, model_type=model_type, pool_path=pool_path)
+
+    # REINVENT 4.5.11 sampling rejects tb_logdir inside [parameters]. Keep the
+    # original line as a comment without importing REINVENT's schema modules.
+    updated_toml = re.sub(r'(?m)^([ \t]*)(tb_logdir[ \t]*=)', r'\1# \2', updated_toml)
     
     # Save to output file
     output_path = f'configs/{model_type}.toml'
@@ -89,15 +96,13 @@ def run_reinvent(config_file: str):
     """
 
     log_file = config_file.replace(".toml", ".log")
-    command = [
-        "reinvent",
-        "-l", log_file,
-        config_file
-    ]
+    command = reinvent_command(config_file, log_file)
     
     try:
         # Run the command
-        subprocess.run(command, check=True)
+        # Windows Python startup can block on an inherited MCP protocol pipe.
+        stdin_options = {"stdin": subprocess.DEVNULL} if sys.platform == "win32" else {}
+        subprocess.run(command, check=True, **stdin_options)
         return "REINVENT execution completed successfully."
     except subprocess.CalledProcessError as e:
         return f"Error occurred while running REINVENT: {e}"

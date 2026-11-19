@@ -1,34 +1,26 @@
 
 from langchain.agents import initialize_agent, AgentType
 from langchain.memory import ChatMessageHistory
-from langchain_community.chat_models import ChatOpenAI, ChatAnthropic
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import OpenAIEmbeddings
 from langchain.memory import VectorStoreRetrieverMemory
 from langchain.docstore.in_memory import InMemoryDocstore
-from langchain.callbacks import get_openai_callback
 from agentD.prompts.base_template import PREFIX, FORMAT_INSTRUCTIONS, SUFFIX
 import faiss
-import os
-from configs.secret_keys import serper_api_key, openai_api_key
+from agentD.providers.deepseek import get_chat_model
+from agentD.local_embeddings import get_embeddings
+from agentD.runtime_config import configure_runtime
 import warnings
 warnings.filterwarnings('ignore')
 
-
-os.environ["SERPER_API_KEY"] = serper_api_key
-os.environ["OPENAI_API_KEY"] = openai_api_key
-
-
-EMBEDDING_MODEL = 'text-embedding-3-large' 
 
 class agentD:
     def __init__(
         self,
         tools,
-        model="gpt-3.5-turbo",
+        model=None,
         temp=0.1,
         agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-        max_iterations=100,
+        max_iterations=10,
         **kwargs
     ):
         self.tools = tools
@@ -43,23 +35,16 @@ class agentD:
         chat_history = ChatMessageHistory(variable_name="chat_history")
         
         # Initialize Language Model
-        if isinstance(model, str) and model.startswith("gpt"):
-            self.model = ChatOpenAI(
-                temperature=temp,
-                model_name=model,
-                request_timeout=1000,
-                max_tokens=4096,
-            )
-        else:
-            raise NotImplementedError("Only OpenAI GPT models are supported at this time.")
+        if model:
+            configure_runtime({'model':model})
+        self.model = get_chat_model(model=model,temperature=temp)
         
         # Initialize Embedding-based Memory
-        embedding_dim = 3072  # Dimensions of the OpenAIEmbeddings
-        faiss_index = faiss.IndexFlatL2(embedding_dim)
-        embedding_fn = OpenAIEmbeddings(model=EMBEDDING_MODEL).embed_query
+        embeddings = get_embeddings()
+        faiss_index = faiss.IndexFlatL2(embeddings.dimension)
         docstore = InMemoryDocstore({})  # Stores vector embeddings
         id_mapping = {}
-        vector_store = FAISS(embedding_fn, faiss_index, docstore, id_mapping)
+        vector_store = FAISS(embeddings, faiss_index, docstore, id_mapping)
         retriever = vector_store.as_retriever(search_kwargs={"k": 5})
         memory = VectorStoreRetrieverMemory(
             retriever=retriever,
@@ -74,7 +59,7 @@ class agentD:
             tools=self.tools,
             llm=self.model,
             agent=agent_type,
-            verbose=True,
+            verbose=False,
             memory=memory,
             handle_parsing_errors=True,
             max_iterations=max_iterations,
@@ -99,10 +84,8 @@ class agentD:
         )
     
     def __call__(self, prompt):
-        with get_openai_callback() as cb:
-            tool_desc = [tool.description for tool in self.tools]
-            result = self.agent.invoke({"input": prompt, "tool_desc": tool_desc})
-        return result
+        tool_desc = [tool.description for tool in self.tools]
+        return self.agent.invoke({"input": prompt, "tool_desc": tool_desc})
     
     async def iter(self, prompt):
         """

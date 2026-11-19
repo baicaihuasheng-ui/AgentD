@@ -1,0 +1,6 @@
+protein: "SRD5A2"
+disease: "androgenetic alopecia"
+model: "deepseek-flash"
+iterations: 3
+num_smiles: 20
+run_boltz: false

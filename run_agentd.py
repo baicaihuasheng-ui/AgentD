@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 # Suppress RDKit C-level stderr warnings at the earliest possible point
@@ -29,10 +30,13 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 _sys_path_backup = sys.path[:]
 sys.path = [p for p in sys.path if os.path.abspath(p) != _script_dir]
 
-from fastmcp import Client
-from fastmcp.client.transports import StdioTransport
+try:
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
+finally:
+    sys.path = _sys_path_backup
 
-sys.path = _sys_path_backup
+from agentD.runtime_config import configure_runtime,load_runtime
 
 
 # Default configuration
@@ -44,7 +48,7 @@ DEFAULT_CONFIG = {
     "run_boltz": True,
     "boltz_top_k": 2,
     "boltz_extra_args_json": '["--use_msa_server","--accelerator","gpu","--num_workers","4"]',
-    "model": "gpt-4o",
+    "model": "deepseek-flash",
     "min_qed": 0.50,   # Minimum QED score for candidate selection
     "min_pkd": 5.0,    # Minimum pKd value for candidate selection
 }
@@ -53,24 +57,17 @@ DEFAULT_CONFIG = {
 def load_config(config_path: str = None) -> dict:
     """Load configuration from YAML file or use defaults."""
     config = DEFAULT_CONFIG.copy()
+    config["model"] = load_runtime().model
     
     if config_path:
-        try:
-            import yaml
-            with open(config_path, "r") as f:
-                user_config = yaml.safe_load(f)
-            if user_config:
-                config.update(user_config)
-            print(f"Loaded config from: {config_path}")
-        except ImportError:
-            print("Warning: PyYAML not installed. Using default config.")
-            print("Install with: pip install pyyaml")
-        except FileNotFoundError:
-            print(f"Warning: Config file not found: {config_path}")
-            print("Using default config.")
-        except Exception as e:
-            print(f"Warning: Error loading config: {e}")
-            print("Using default config.")
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            user_config = yaml.safe_load(f)
+        if user_config is not None and not isinstance(user_config, dict):
+            raise ValueError("Pipeline config must be a YAML mapping")
+        if user_config:
+            config.update(user_config)
+        print(f"Loaded config from: {config_path}")
     
     return config
 
@@ -80,65 +77,51 @@ def find_latest_run_dir():
     runs_dir = os.path.join(os.path.dirname(__file__), "runs")
     if not os.path.exists(runs_dir):
         return None
-    dirs = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+    dirs = [d for d in os.listdir(runs_dir) if os.path.isfile(os.path.join(runs_dir, d, "status.json"))]
     if not dirs:
         return None
-    dirs.sort(reverse=True)
+    dirs.sort(key=lambda d: os.path.getmtime(os.path.join(runs_dir, d, "status.json")), reverse=True)
     return os.path.join(runs_dir, dirs[0])
 
 
-async def monitor_progress_background(stop_event: asyncio.Event, interval: int = 5):
-    """Monitor progress by reading status.json periodically in background."""
-    last_step = None
-    last_details = None
-    run_dir = None
-    
-    while not stop_event.is_set():
-        # Use wait_for with timeout to be responsive to stop_event
+async def monitor_progress_background(stop_event: asyncio.Event, run_dir: Path, interval: float = 5):
+    """Track the status file belonging to this pipeline invocation."""
+    run_dir = Path(run_dir).resolve()
+    status_file = run_dir / "status.json"
+    last_display = None
+    last_error = None
+    print(f"\n  [RUN DIR] {run_dir}", flush=True)
+
+    while True:
+        try:
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+            current_step = status.get("current_step", "unknown")
+            steps = status.get("steps", [])
+            details = steps[-1].get("details", {}) if steps else {}
+            display = (current_step, json.dumps(details, sort_keys=True, ensure_ascii=False))
+            if display != last_display:
+                detail_text = " | ".join(f"{key}={value}" for key, value in details.items())
+                timestamp = time.strftime("%H:%M:%S")
+                suffix = f" | {detail_text}" if detail_text else ""
+                print(f"  [{timestamp}] {current_step}{suffix}", flush=True)
+                last_display = display
+            last_error = None
+        except (FileNotFoundError, json.JSONDecodeError):
+            if last_display is None:
+                print("  等待初始化：status.json 尚未就绪", flush=True)
+                last_display = ("waiting", "")
+        except Exception as error:
+            diagnostic = f"{type(error).__name__}: {error}"
+            if diagnostic != last_error:
+                print(f"  进度读取失败 [{status_file}] {diagnostic}", flush=True)
+                last_error = diagnostic
+
+        if stop_event.is_set():
+            break
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            break  # stop_event was set
         except asyncio.TimeoutError:
-            pass  # Continue monitoring
-        
-        # Find run dir if not found yet
-        if run_dir is None:
-            run_dir = find_latest_run_dir()
-            if run_dir:
-                print(f"\n  [RUN DIR] {run_dir}")
-        
-        if run_dir is None:
-            continue
-            
-        status_file = os.path.join(run_dir, "status.json")
-        if os.path.exists(status_file):
-            try:
-                with open(status_file, "r") as f:
-                    status = json.load(f)
-                current_step = status.get("current_step", "unknown")
-                steps = status.get("steps", [])
-                
-                # Get latest step details
-                details = ""
-                if steps:
-                    latest = steps[-1]
-                    step_details = latest.get("details", {})
-                    if step_details:
-                        detail_parts = []
-                        for k, v in step_details.items():
-                            if k not in ("substep",) and v is not None:
-                                detail_parts.append(f"{k}={v}")
-                        if detail_parts:
-                            details = " | " + ", ".join(detail_parts[:3])
-                
-                if current_step != last_step or details != last_details:
-                    last_step = current_step
-                    last_details = details
-                    timestamp = time.strftime("%H:%M:%S")
-                    print(f"  [{timestamp}] {current_step}{details}", flush=True)
-                    
-            except Exception:
-                pass
+            pass
 
 
 async def run_qna_mode(config: dict):
@@ -149,8 +132,10 @@ async def run_qna_mode(config: dict):
         args=[server_script],
         cwd=os.path.dirname(server_script),
         env={
-            "AGENTD_FORCE_CONDA_RUN": "1",
-            "AGENTD_CONDA_ENV": "agentd",
+            **{k: v for k, v in os.environ.items() if k.startswith(("AGENTD_", "DEEPSEEK_", "HF_", "TRANSFORMERS_"))},
+            "AGENTD_FORCE_CONDA_RUN": "0",
+            "PYTHONNOUSERSITE": "1",
+            "TMP": os.environ.get("TMP", os.environ.get("TEMP", "")),
         },
     )
 
@@ -163,7 +148,7 @@ async def run_qna_mode(config: dict):
 
         default_protein = config.get("protein", "")
         default_disease = config.get("disease", "")
-        default_model = config.get("model", "gpt-4o")
+        default_model = config.get("model", "deepseek-flash")
 
         print(f"Default protein: {default_protein or '(none)'}")
         print(f"Default disease: {default_disease or '(none)'}")
@@ -265,14 +250,25 @@ async def run_qna_mode(config: dict):
 
 async def run_pipeline_mode(config: dict):
     """Run full pipeline mode with given config."""
+    config = dict(config)
+    run_id = config.get("run_id") or time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    config["run_id"] = run_id
+    run_dir = (Path(__file__).resolve().parent / "runs" / run_id).resolve()
+    server_log = run_dir / "logs" / "mcp_server.log"
+    server_log.parent.mkdir(parents=True, exist_ok=True)
+    print(f"  [MCP LOG] {server_log}", flush=True)
     server_script = os.path.join(os.path.dirname(__file__), "mcp_agent.py")
     transport = StdioTransport(
+        log_file=server_log,
+        keep_alive=False,
         command=sys.executable,
         args=[server_script],
         cwd=os.path.dirname(server_script),
         env={
-            "AGENTD_FORCE_CONDA_RUN": "1",
-            "AGENTD_CONDA_ENV": "agentd",
+            **{k: v for k, v in os.environ.items() if k.startswith(("AGENTD_", "DEEPSEEK_", "HF_", "TRANSFORMERS_"))},
+            "AGENTD_FORCE_CONDA_RUN": "0",
+            "PYTHONNOUSERSITE": "1",
+            "TMP": os.environ.get("TMP", os.environ.get("TEMP", "")),
         },
     )
 
@@ -306,7 +302,7 @@ async def run_pipeline_mode(config: dict):
         
         # Start background progress monitor
         stop_monitor = asyncio.Event()
-        monitor_task = asyncio.create_task(monitor_progress_background(stop_monitor))
+        monitor_task = asyncio.create_task(monitor_progress_background(stop_monitor, run_dir))
     
         # Build pipeline parameters
         pipeline_params = {
@@ -326,11 +322,11 @@ async def run_pipeline_mode(config: dict):
         if config.get("run_id"):
             pipeline_params["run_id"] = config["run_id"]
         
-        result = await client.call_tool("agentd_run_pipeline", pipeline_params)
-
-        # Stop the progress monitor
-        stop_monitor.set()
-        await monitor_task
+        try:
+            result = await client.call_tool("agentd_run_pipeline", pipeline_params)
+        finally:
+            stop_monitor.set()
+            await monitor_task
         
         elapsed = time.time() - start_time
 
@@ -342,6 +338,7 @@ async def run_pipeline_mode(config: dict):
         print("=" * 70, flush=True)
         
         # Parse and pretty-print the result
+        pipeline_ok = False
         if result and hasattr(result, 'content'):
             for content_item in result.content:
                 if hasattr(content_item, 'text'):
@@ -351,6 +348,7 @@ async def run_pipeline_mode(config: dict):
                         
                         # Print summary
                         if isinstance(data, dict):
+                            pipeline_ok = data.get("ok") is True and not getattr(result,"is_error",False)
                             print("\n" + "-" * 70, flush=True)
                             print("SUMMARY:", flush=True)
                             print(f"  Run ID: {data.get('run_id', 'N/A')}", flush=True)
@@ -376,13 +374,12 @@ async def run_pipeline_mode(config: dict):
             print(result, flush=True)
 
         print("\n" + "=" * 70, flush=True)
-        print("PIPELINE COMPLETED SUCCESSFULLY!", flush=True)
+        print("PIPELINE COMPLETED SUCCESSFULLY!" if pipeline_ok else "PIPELINE FAILED — inspect result and logs", flush=True)
         print("=" * 70, flush=True)
         print("\nCheck status.json for detailed pipeline status.", flush=True)
         print(flush=True)
         
-        # Suppress stderr to prevent RDKit warnings from appearing after completion
-        sys.stderr = open(os.devnull, 'w')
+        return pipeline_ok
 
 
 
@@ -406,18 +403,17 @@ Examples:
 
     # Load config (used by both pipeline and Q&A modes)
     config = load_config(args.config)
+    configure_runtime(config)
 
     if args.qna:
         await run_qna_mode(config)
     else:
-        await run_pipeline_mode(config)
+        return 0 if await run_pipeline_mode(config) else 1
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        sys.exit(asyncio.run(main()) or 0)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
-    finally:
-        sys.stderr = open(os.devnull, 'w')
-        os._exit(0)  
+        sys.exit(130)
